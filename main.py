@@ -57,18 +57,14 @@ class RateLimitPlugin(Star):
         self.max_requests: int = max(1, int(self.config.get("max_requests", 6)))
         self.time_window: int = max(1, int(self.config.get("time_window_seconds", 60)))
         self.default_group_total: int = max(0, int(self.config.get("default_group_total", 0)))
-        self.whitelist: list = self.config.get("whitelist", [])
-        self.group_limits: Dict[str, int] = _parse_limit_list(self.config.get("group_limits", []))
-        self.group_total_limits: Dict[str, int] = _parse_limit_list(self.config.get("group_total_limits", []))
-        self.user_limits: Dict[str, int] = _parse_limit_list(self.config.get("user_limits", []))
-        self.tip_message: str = self.config.get(
-            "tip_message",
+        self.whitelist: list = self.config.get("whitelist") or []
+        self.group_limits: Dict[str, int] = _parse_limit_list(self.config.get("group_limits") or [])
+        self.group_total_limits: Dict[str, int] = _parse_limit_list(self.config.get("group_total_limits") or [])
+        self.user_limits: Dict[str, int] = _parse_limit_list(self.config.get("user_limits") or [])
+        self.tip_message: str = self.config.get("tip_message") or \
             "⚠️ 请求过于频繁，请在 {cooldown} 秒后再试。（限制：{window} 秒内最多 {max} 次）"
-        )
-        self.group_tip_message: str = self.config.get(
-            "group_tip_message",
+        self.group_tip_message: str = self.config.get("group_tip_message") or \
             "⚠️ 本群请求过于频繁，请在 {cooldown} 秒后再试。（群限制：{window} 秒内合计最多 {max} 次）"
-        )
 
     def _save_limits(self):
         """将所有限制字典序列化后保存到配置。"""
