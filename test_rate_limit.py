@@ -22,8 +22,8 @@ class RateLimiter:
         self.group_total_limits: dict = group_total_limits or {}
         self.user_limits: dict = user_limits or {}
         self.whitelist: list = whitelist or []
-        self._user_records: dict[str, deque] = defaultdict(deque)
-        self._group_records: dict[str, deque] = defaultdict(deque)
+        self._user_records: dict[str, deque[float]] = defaultdict(deque)
+        self._group_records: dict[str, deque[float]] = defaultdict(deque)
 
     def resolve_max_requests(self, user_id: str, group_id: str | None) -> int:
         if user_id in self.user_limits:
@@ -51,7 +51,7 @@ class RateLimiter:
         return True, 0.0
 
     def request(self, user_id: str, group_id: str | None = None,
-                now: float = None) -> Tuple[bool, float, str]:
+                now: float | None = None) -> Tuple[bool, float, str]:
         """模拟完整请求流程。返回 (allowed, cooldown, reason)。"""
         if now is None:
             now = time.time()

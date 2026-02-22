@@ -5,7 +5,7 @@ from typing import Dict, Tuple
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.event.filter import PermissionType
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.api.provider import ProviderRequest
 
 
@@ -34,17 +34,21 @@ def _dump_limit_dict(d: Dict[str, int]) -> list[str]:
     return [f"{k}:{v}" for k, v in d.items()]
 
 
-@register("astrbot_plugin_rate_limit", "Antigravity", "限制用户请求 LLM 的频率，支持白名单和分组限频", "1.2.0")
 class RateLimitPlugin(Star):
+    # 自动清理间隔（秒）
+    _CLEANUP_INTERVAL = 300  # 5 分钟
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self._reload_config()
 
         # 用户级滑动窗口: user_id -> deque[timestamp]
-        self._request_records: dict[str, deque] = defaultdict(deque)
+        self._request_records: dict[str, deque[float]] = defaultdict(deque)
         # 群组级滑动窗口: group_id -> deque[timestamp]
-        self._group_records: dict[str, deque] = defaultdict(deque)
+        self._group_records: dict[str, deque[float]] = defaultdict(deque)
+        # 上次自动清理时间
+        self._last_cleanup: float = time.time()
 
     def _reload_config(self):
         """从配置对象加载/重新加载所有参数。"""
@@ -122,6 +126,17 @@ class RateLimitPlugin(Star):
             for k in empty_keys:
                 del d[k]
 
+    def _maybe_auto_cleanup(self, now: float):
+        """定期自动清理过期记录和空 key，防止内存膨胀。"""
+        if now - self._last_cleanup < self._CLEANUP_INTERVAL:
+            return
+        self._last_cleanup = now
+        window_start = now - self.time_window
+        for records in list(self._request_records.values()) + list(self._group_records.values()):
+            while records and records[0] <= window_start:
+                records.popleft()
+        self._cleanup_empty_records()
+
     # ─── Hook: LLM 请求前拦截 ────────────────────────────────────
 
     @filter.on_llm_request()
@@ -142,6 +157,9 @@ class RateLimitPlugin(Star):
 
         now = time.time()
         group_id = event.get_group_id()
+
+        # 定期自动清理过期记录
+        self._maybe_auto_cleanup(now)
 
         # ── 检查 1: 用户级频率 ──
         if self.enable_user_limit:
@@ -199,8 +217,8 @@ class RateLimitPlugin(Star):
             while records and records[0] <= window_start:
                 records.popleft()
         self._cleanup_empty_records()
-        active_users = sum(1 for q in self._request_records.values() if q)
-        active_groups = sum(1 for q in self._group_records.values() if q)
+        active_users = len(self._request_records)
+        active_groups = len(self._group_records)
         gt_default = f"{self.default_group_total} 次" if self.default_group_total > 0 else "不限制"
         ul_status = "✅ 开启" if self.enable_user_limit else "❌ 关闭"
         gl_status = "✅ 开启" if self.enable_group_total_limit else "❌ 关闭"
