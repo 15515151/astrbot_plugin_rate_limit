@@ -1,7 +1,7 @@
 {
   "max_requests": {
     "type": "int",
-    "description": "全局默认：时间窗口内允许的最大 LLM 请求次数",
+    "description": "全局默认：时间窗口内每个用户允许的最大 LLM 请求次数",
     "hint": "每个用户在时间窗口内最多可以发送的 LLM 请求数量（全局默认值）",
     "default": 6
   },
@@ -19,8 +19,14 @@
   },
   "group_limits": {
     "type": "list",
-    "description": "群组自定义频率限制",
-    "hint": "格式: 群组ID:最大次数，如 12345:7 表示群12345限制7次。每行一条。",
+    "description": "群组内每个用户的自定义频率限制",
+    "hint": "格式: 群组ID:最大次数，如 12345:7 表示群12345内每个用户限制7次。每行一条。",
+    "default": []
+  },
+  "group_total_limits": {
+    "type": "list",
+    "description": "群组整体总请求次数限制",
+    "hint": "格式: 群组ID:最大次数，如 12345:20 表示群12345内所有用户合计最多请求20次。每行一条。未配置的群组不限制总次数。",
     "default": []
   },
   "user_limits": {
@@ -34,5 +40,11 @@
     "description": "超限提示消息模板",
     "hint": "支持变量: {cooldown} 剩余冷却秒数, {max} 最大次数, {window} 窗口秒数",
     "default": "⚠️ 请求过于频繁，请在 {cooldown} 秒后再试。（限制：{window} 秒内最多 {max} 次）"
+  },
+  "group_tip_message": {
+    "type": "string",
+    "description": "群组总量超限提示消息模板",
+    "hint": "支持变量: {cooldown} 剩余冷却秒数, {max} 群组总限制次数, {window} 窗口秒数",
+    "default": "⚠️ 本群请求过于频繁，请在 {cooldown} 秒后再试。（群限制：{window} 秒内合计最多 {max} 次）"
   }
 }

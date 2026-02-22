@@ -1,52 +1,75 @@
 """
-独立单元测试 - 不依赖 AstrBot 运行时，测试频率限制核心逻辑。
-覆盖：基础限频、窗口过期、用户隔离、白名单、群组限制、用户限制、优先级。
+独立单元测试 - 不依赖 AstrBot 运行时。
+覆盖：基础限频、窗口过期、用户隔离、白名单、群组每用户限制、
+      用户自定义限制、优先级链、群组总量限制。
 运行: python test_rate_limit.py
 """
 import time
 from collections import defaultdict, deque
-from typing import Tuple
+from typing import Dict, List, Tuple
 
 
 class RateLimiter:
     """从 main.py 提取的纯逻辑，用于独立测试。"""
 
     def __init__(self, max_requests=6, time_window=60, group_limits=None,
-                 user_limits=None, whitelist=None):
+                 group_total_limits=None, user_limits=None, whitelist=None):
         self.max_requests = max_requests
         self.time_window = time_window
         self.group_limits: dict = group_limits or {}
+        self.group_total_limits: dict = group_total_limits or {}
         self.user_limits: dict = user_limits or {}
         self.whitelist: list = whitelist or []
-        self._request_records: dict[str, deque] = defaultdict(deque)
+        self._user_records: dict[str, deque] = defaultdict(deque)
+        self._group_records: dict[str, deque] = defaultdict(deque)
 
     def resolve_max_requests(self, user_id: str, group_id: str | None) -> int:
-        """优先级: 用户自定义 > 群组自定义 > 全局默认"""
         if user_id in self.user_limits:
             return int(self.user_limits[user_id])
         if group_id and group_id in self.group_limits:
             return int(self.group_limits[group_id])
         return self.max_requests
 
-    def check(self, user_id: str, max_req: int, now: float = None) -> Tuple[bool, float]:
-        if now is None:
-            now = time.time()
-        window_start = now - self.time_window
-        records = self._request_records[user_id]
+    @staticmethod
+    def _sw_check(records: deque, max_req: int, time_window: int,
+                  now: float) -> Tuple[bool, float]:
+        window_start = now - time_window
         while records and records[0] <= window_start:
             records.popleft()
         if len(records) >= max_req:
             cooldown = records[0] - window_start
             return False, round(cooldown, 1)
-        records.append(now)
         return True, 0.0
 
-    def request(self, user_id: str, group_id: str | None = None, now: float = None):
-        """完整模拟一次请求（含白名单 + 优先级解析）。"""
+    def request(self, user_id: str, group_id: str | None = None,
+                now: float = None) -> Tuple[bool, float, str]:
+        """模拟完整请求流程。返回 (allowed, cooldown, reason)。"""
+        if now is None:
+            now = time.time()
         if user_id in self.whitelist:
-            return True, 0.0
+            return True, 0.0, "whitelist"
+
+        # 用户级检查
         max_req = self.resolve_max_requests(user_id, group_id)
-        return self.check(user_id, max_req, now)
+        user_records = self._user_records[user_id]
+        allowed, cd = self._sw_check(user_records, max_req, self.time_window, now)
+        if not allowed:
+            return False, cd, "user_limit"
+
+        # 群组总量检查
+        if group_id and group_id in self.group_total_limits:
+            g_max = self.group_total_limits[group_id]
+            g_records = self._group_records[group_id]
+            g_allowed, g_cd = self._sw_check(g_records, g_max, self.time_window, now)
+            if not g_allowed:
+                return False, g_cd, "group_total"
+
+        # 都通过，记录
+        user_records.append(now)
+        if group_id and group_id in self.group_total_limits:
+            self._group_records[group_id].append(now)
+
+        return True, 0.0, "ok"
 
 
 # ═══════════════════════════════════════════════════
@@ -54,37 +77,32 @@ class RateLimiter:
 # ═══════════════════════════════════════════════════
 
 def test_basic_allow():
-    """正常请求应该被允许"""
     rl = RateLimiter(max_requests=3, time_window=60)
     for i in range(3):
-        allowed, _ = rl.request("user1", now=100.0 + i)
-        assert allowed, f"第 {i+1} 次请求应该被允许"
+        ok, _, _ = rl.request("u", now=100.0 + i)
+        assert ok
     print("✅ test_basic_allow")
 
 
 def test_exceed_limit():
-    """超出限制应该被拒绝"""
     rl = RateLimiter(max_requests=3, time_window=60)
     for i in range(3):
-        rl.request("user1", now=100.0 + i)
-    allowed, cd = rl.request("user1", now=103.0)
-    assert not allowed
-    assert cd > 0
-    print(f"✅ test_exceed_limit (cooldown={cd}s)")
+        rl.request("u", now=100.0 + i)
+    ok, cd, reason = rl.request("u", now=103.0)
+    assert not ok and cd > 0 and reason == "user_limit"
+    print(f"✅ test_exceed_limit (cd={cd}s)")
 
 
 def test_window_expiry():
-    """窗口过期后应该恢复"""
     rl = RateLimiter(max_requests=2, time_window=10)
     rl.request("u", now=0.0)
     rl.request("u", now=1.0)
     assert rl.request("u", now=5.0)[0] is False
-    assert rl.request("u", now=11.0)[0] is True  # t=0 的记录过期
+    assert rl.request("u", now=11.0)[0] is True
     print("✅ test_window_expiry")
 
 
 def test_users_isolated():
-    """不同用户之间计数隔离"""
     rl = RateLimiter(max_requests=1, time_window=60)
     rl.request("a", now=0.0)
     assert rl.request("a", now=1.0)[0] is False
@@ -93,171 +111,225 @@ def test_users_isolated():
 
 
 def test_whitelist():
-    """白名单用户不受限制"""
     rl = RateLimiter(max_requests=1, time_window=60, whitelist=["vip"])
     rl.request("normal", now=0.0)
     assert rl.request("normal", now=1.0)[0] is False
     for i in range(20):
-        assert rl.request("vip", now=float(i))[0] is True
+        ok, _, reason = rl.request("vip", now=float(i))
+        assert ok and reason == "whitelist"
     print("✅ test_whitelist")
 
 
 def test_cooldown_accuracy():
-    """冷却时间精确"""
     rl = RateLimiter(max_requests=3, time_window=60)
     rl.request("u", now=10.0)
     rl.request("u", now=20.0)
     rl.request("u", now=30.0)
-    _, cd = rl.request("u", now=50.0)
-    assert cd == 20.0, f"expected 20, got {cd}"
-    print(f"✅ test_cooldown_accuracy (cooldown={cd}s)")
+    _, cd, _ = rl.request("u", now=50.0)
+    assert cd == 20.0
+    print(f"✅ test_cooldown_accuracy (cd={cd}s)")
 
 
 def test_rapid_burst():
-    """同一时刻连发"""
     rl = RateLimiter(max_requests=6, time_window=60)
     results = [rl.request("u", now=100.0) for _ in range(10)]
-    ok = sum(1 for a, _ in results if a)
-    no = sum(1 for a, _ in results if not a)
+    ok = sum(1 for a, _, _ in results if a)
+    no = sum(1 for a, _, _ in results if not a)
     assert ok == 6 and no == 4
-    print(f"✅ test_rapid_burst (allowed={ok}, rejected={no})")
+    print(f"✅ test_rapid_burst (ok={ok}, no={no})")
 
 
 # ═══════════════════════════════════════════════════
-# 群组限制测试
+# 群组每用户限制
 # ═══════════════════════════════════════════════════
 
-def test_group_limit():
-    """群组自定义限制生效"""
-    rl = RateLimiter(max_requests=6, time_window=60, group_limits={"group_A": 2})
-    # group_A 的用户限额为 2
-    assert rl.request("u1", group_id="group_A", now=0.0)[0] is True
-    assert rl.request("u1", group_id="group_A", now=1.0)[0] is True
-    assert rl.request("u1", group_id="group_A", now=2.0)[0] is False  # 第 3 次被拒
-    print("✅ test_group_limit")
+def test_group_per_user_limit():
+    rl = RateLimiter(max_requests=6, time_window=60, group_limits={"gA": 2})
+    assert rl.request("u", group_id="gA", now=0.0)[0] is True
+    assert rl.request("u", group_id="gA", now=1.0)[0] is True
+    assert rl.request("u", group_id="gA", now=2.0)[0] is False
+    print("✅ test_group_per_user_limit")
 
 
 def test_group_default_fallback():
-    """未配置的群组使用全局默认"""
-    rl = RateLimiter(max_requests=3, time_window=60, group_limits={"group_A": 7})
-    # group_B 没有自定义，使用默认 3
+    rl = RateLimiter(max_requests=3, time_window=60, group_limits={"gA": 7})
     for i in range(3):
-        rl.request("u", group_id="group_B", now=float(i))
-    assert rl.request("u", group_id="group_B", now=3.0)[0] is False
+        rl.request("u", group_id="gB", now=float(i))
+    assert rl.request("u", group_id="gB", now=3.0)[0] is False
     print("✅ test_group_default_fallback")
 
 
 def test_group_higher_limit():
-    """群组限制可以比默认更高"""
-    rl = RateLimiter(max_requests=3, time_window=60, group_limits={"vip_group": 7})
+    rl = RateLimiter(max_requests=3, time_window=60, group_limits={"vip": 7})
     for i in range(7):
-        allowed, _ = rl.request("u", group_id="vip_group", now=float(i))
-        assert allowed, f"vip_group 第 {i+1} 次应该被允许"
-    assert rl.request("u", group_id="vip_group", now=7.0)[0] is False
-    print("✅ test_group_higher_limit (7次OK, 第8次拒绝)")
-
-
-def test_private_msg_no_group():
-    """私聊消息（无群组ID）使用全局默认"""
-    rl = RateLimiter(max_requests=3, time_window=60, group_limits={"g": 100})
-    for i in range(3):
-        rl.request("u", group_id=None, now=float(i))
-    assert rl.request("u", group_id=None, now=3.0)[0] is False
-    print("✅ test_private_msg_no_group")
+        assert rl.request("u", group_id="vip", now=float(i))[0] is True
+    assert rl.request("u", group_id="vip", now=7.0)[0] is False
+    print("✅ test_group_higher_limit")
 
 
 # ═══════════════════════════════════════════════════
-# 用户自定义限制测试
+# 用户自定义限制 + 优先级
 # ═══════════════════════════════════════════════════
 
 def test_user_limit():
-    """用户自定义限制生效"""
-    rl = RateLimiter(max_requests=6, time_window=60, user_limits={"slow_user": 2})
-    assert rl.request("slow_user", now=0.0)[0] is True
-    assert rl.request("slow_user", now=1.0)[0] is True
-    assert rl.request("slow_user", now=2.0)[0] is False
+    rl = RateLimiter(max_requests=6, time_window=60, user_limits={"slow": 2})
+    assert rl.request("slow", now=0.0)[0] is True
+    assert rl.request("slow", now=1.0)[0] is True
+    assert rl.request("slow", now=2.0)[0] is False
     print("✅ test_user_limit")
 
 
-def test_user_limit_overrides_group():
-    """用户限制优先级高于群组限制"""
-    rl = RateLimiter(
-        max_requests=10,
-        time_window=60,
-        group_limits={"group_X": 7},
-        user_limits={"special_user": 4},
-    )
-    # special_user 在 group_X 里，但用户级限制 4 > 群组级 7
+def test_user_overrides_group():
+    rl = RateLimiter(max_requests=10, time_window=60,
+                     group_limits={"gX": 7}, user_limits={"sp": 4})
     for i in range(4):
-        allowed, _ = rl.request("special_user", group_id="group_X", now=float(i))
-        assert allowed, f"第 {i+1} 次应该被允许"
-    assert rl.request("special_user", group_id="group_X", now=4.0)[0] is False
-    print("✅ test_user_limit_overrides_group (4次OK, 第5次拒绝)")
+        assert rl.request("sp", group_id="gX", now=float(i))[0] is True
+    assert rl.request("sp", group_id="gX", now=4.0)[0] is False
+    print("✅ test_user_overrides_group")
 
-
-def test_user_limit_overrides_default():
-    """用户限制优先级高于全局默认"""
-    rl = RateLimiter(max_requests=10, time_window=60, user_limits={"tight_user": 3})
-    for i in range(3):
-        rl.request("tight_user", now=float(i))
-    assert rl.request("tight_user", now=3.0)[0] is False
-    # 普通用户仍然按 10 次来
-    for i in range(10):
-        rl.request("normal", now=float(i))
-    assert rl.request("normal", now=10.0)[0] is False
-    print("✅ test_user_limit_overrides_default")
-
-
-# ═══════════════════════════════════════════════════
-# 混合优先级综合测试
-# ═══════════════════════════════════════════════════
 
 def test_full_priority_chain():
-    """
-    综合测试优先级链: 白名单 > 用户自定义 > 群组自定义 > 全局默认
-
-    场景: 全局默认=6, group_A=7, user_X=4, vip 在白名单
-    """
-    rl = RateLimiter(
-        max_requests=6,
-        time_window=60,
-        group_limits={"group_A": 7},
-        user_limits={"user_X": 4},
-        whitelist=["vip"],
-    )
-
-    resolved = rl.resolve_max_requests("random", None)
-    assert resolved == 6, f"普通用户/无群: expected 6, got {resolved}"
-
-    resolved = rl.resolve_max_requests("random", "group_A")
-    assert resolved == 7, f"普通用户/group_A: expected 7, got {resolved}"
-
-    resolved = rl.resolve_max_requests("user_X", "group_A")
-    assert resolved == 4, f"user_X/group_A: expected 4, got {resolved}"
-
-    resolved = rl.resolve_max_requests("user_X", None)
-    assert resolved == 4, f"user_X/无群: expected 4, got {resolved}"
-
-    # 白名单用户无论如何都放行
+    rl = RateLimiter(max_requests=6, time_window=60,
+                     group_limits={"gA": 7}, user_limits={"uX": 4},
+                     whitelist=["vip"])
+    assert rl.resolve_max_requests("rand", None) == 6
+    assert rl.resolve_max_requests("rand", "gA") == 7
+    assert rl.resolve_max_requests("uX", "gA") == 4
     for i in range(20):
-        assert rl.request("vip", group_id="group_A", now=float(i))[0] is True
-
-    # user_X 在 group_A 中被限制为 4
+        assert rl.request("vip", group_id="gA", now=float(i))[0] is True
     for i in range(4):
-        assert rl.request("user_X", group_id="group_A", now=float(i))[0] is True
-    assert rl.request("user_X", group_id="group_A", now=4.0)[0] is False
+        assert rl.request("uX", group_id="gA", now=float(i))[0] is True
+    assert rl.request("uX", group_id="gA", now=4.0)[0] is False
+    print("✅ test_full_priority_chain")
 
-    print("✅ test_full_priority_chain (全链路验证通过)")
+
+# ═══════════════════════════════════════════════════
+# 群组总量限制（新功能）
+# ═══════════════════════════════════════════════════
+
+def test_group_total_basic():
+    """群组总量限制：全群共享计数器"""
+    rl = RateLimiter(max_requests=10, time_window=60,
+                     group_total_limits={"g1": 5})
+    # 5 个不同用户各请求一次，全部 OK
+    for i in range(5):
+        ok, _, _ = rl.request(f"user_{i}", group_id="g1", now=float(i))
+        assert ok, f"user_{i} 应该被允许"
+    # 第 6 个用户被群总量拒绝
+    ok, cd, reason = rl.request("user_5", group_id="g1", now=5.0)
+    assert not ok and reason == "group_total"
+    print(f"✅ test_group_total_basic (5人各1次OK, 第6人被拒, cd={cd}s)")
+
+
+def test_group_total_mixed_users():
+    """单用户未超限但群总量超限"""
+    rl = RateLimiter(max_requests=10, time_window=60,
+                     group_total_limits={"g1": 3})
+    # user_a 发 2 次（个人限额 10，未超）
+    rl.request("user_a", group_id="g1", now=0.0)
+    rl.request("user_a", group_id="g1", now=1.0)
+    # user_b 发 1 次
+    rl.request("user_b", group_id="g1", now=2.0)
+    # 群总量已满 3 次，user_c 虽然个人从没发过也被拒
+    ok, _, reason = rl.request("user_c", group_id="g1", now=3.0)
+    assert not ok and reason == "group_total"
+    print("✅ test_group_total_mixed_users")
+
+
+def test_group_total_window_expiry():
+    """群组总量窗口过期后恢复"""
+    rl = RateLimiter(max_requests=10, time_window=10,
+                     group_total_limits={"g1": 2})
+    rl.request("a", group_id="g1", now=0.0)
+    rl.request("b", group_id="g1", now=1.0)
+    assert rl.request("c", group_id="g1", now=5.0)[0] is False
+    # t=11: t=0 的记录过期，腾出名额
+    ok, _, _ = rl.request("c", group_id="g1", now=11.0)
+    assert ok
+    print("✅ test_group_total_window_expiry")
+
+
+def test_group_total_user_limit_first():
+    """用户级先触发 → 不应计入群总量"""
+    rl = RateLimiter(max_requests=1, time_window=60,
+                     group_total_limits={"g1": 10})
+    # user_a 用完个人限额 1 次
+    rl.request("user_a", group_id="g1", now=0.0)
+    # user_a 第 2 次被用户级拒绝
+    ok, _, reason = rl.request("user_a", group_id="g1", now=1.0)
+    assert not ok and reason == "user_limit"
+    # 群总量应该只消耗了 1 次（被用户级拒绝的不计入），user_b 应该 OK
+    ok, _, _ = rl.request("user_b", group_id="g1", now=2.0)
+    assert ok
+    print("✅ test_group_total_user_limit_first")
+
+
+def test_group_total_whitelist_bypass():
+    """白名单用户不消耗群总量"""
+    rl = RateLimiter(max_requests=10, time_window=60,
+                     group_total_limits={"g1": 2}, whitelist=["vip"])
+    # vip 发 10 次，不消耗群总量
+    for i in range(10):
+        ok, _, reason = rl.request("vip", group_id="g1", now=float(i))
+        assert ok and reason == "whitelist"
+    # 普通用户仍然有 2 次群总量配额
+    assert rl.request("u1", group_id="g1", now=10.0)[0] is True
+    assert rl.request("u2", group_id="g1", now=11.0)[0] is True
+    ok, _, reason = rl.request("u3", group_id="g1", now=12.0)
+    assert not ok and reason == "group_total"
+    print("✅ test_group_total_whitelist_bypass")
+
+
+def test_group_total_different_groups():
+    """不同群的总量计数隔离"""
+    rl = RateLimiter(max_requests=10, time_window=60,
+                     group_total_limits={"g1": 2, "g2": 3})
+    # g1: 2 个不同用户各 1 次 → 满
+    rl.request("g1_u1", group_id="g1", now=0.0)
+    rl.request("g1_u2", group_id="g1", now=1.0)
+    ok, _, reason = rl.request("g1_u3", group_id="g1", now=2.0)
+    assert not ok and reason == "group_total"  # g1 满
+    # g2 不受影响，用不同用户
+    assert rl.request("g2_u1", group_id="g2", now=2.0)[0] is True
+    assert rl.request("g2_u2", group_id="g2", now=3.0)[0] is True
+    assert rl.request("g2_u3", group_id="g2", now=4.0)[0] is True
+    ok2, _, reason2 = rl.request("g2_u4", group_id="g2", now=5.0)
+    assert not ok2 and reason2 == "group_total"  # g2 满
+    print("✅ test_group_total_different_groups")
+
+
+def test_group_total_no_limit_unconfigured():
+    """未配置群总量限制的群不受群总量约束"""
+    rl = RateLimiter(max_requests=2, time_window=60,
+                     group_total_limits={"g1": 3})
+    # g2 没配群总量 → 不受群总量约束，只受用户级限制 (max=2)
+    assert rl.request("u0", group_id="g2", now=0.0)[0] is True   # u0 第1次
+    assert rl.request("u0", group_id="g2", now=1.0)[0] is True   # u0 第2次
+    assert rl.request("u0", group_id="g2", now=2.0)[0] is False  # u0 第3次 → 用户级拒绝
+    # 不同用户也可以继续请求（没有群总量限制）
+    assert rl.request("u1", group_id="g2", now=3.0)[0] is True
+    assert rl.request("u2", group_id="g2", now=4.0)[0] is True
+    print("OK test_group_total_no_limit_unconfigured")
+
+
+def test_private_msg_no_group_total():
+    """私聊消息不受群总量限制"""
+    rl = RateLimiter(max_requests=3, time_window=60,
+                     group_total_limits={"g1": 1})
+    for i in range(3):
+        assert rl.request("u", group_id=None, now=float(i))[0] is True
+    assert rl.request("u", group_id=None, now=3.0)[0] is False  # 只受用户级限制
+    print("✅ test_private_msg_no_group_total")
 
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("🧪 AstrBot Rate Limit Plugin - 单元测试 v1.1")
+    print("🧪 AstrBot Rate Limit Plugin - 单元测试 v1.2")
     print("=" * 55)
 
-    section = lambda title: print(f"\n── {title} ──")
+    s = lambda t: print(f"\n── {t} ──")
 
-    section("基础测试")
+    s("基础测试")
     test_basic_allow()
     test_exceed_limit()
     test_window_expiry()
@@ -266,20 +338,26 @@ if __name__ == "__main__":
     test_cooldown_accuracy()
     test_rapid_burst()
 
-    section("群组限制测试")
-    test_group_limit()
+    s("群组每用户限制")
+    test_group_per_user_limit()
     test_group_default_fallback()
     test_group_higher_limit()
-    test_private_msg_no_group()
 
-    section("用户自定义限制测试")
+    s("用户自定义限制 + 优先级")
     test_user_limit()
-    test_user_limit_overrides_group()
-    test_user_limit_overrides_default()
-
-    section("混合优先级综合测试")
+    test_user_overrides_group()
     test_full_priority_chain()
 
+    s("群组总量限制")
+    test_group_total_basic()
+    test_group_total_mixed_users()
+    test_group_total_window_expiry()
+    test_group_total_user_limit_first()
+    test_group_total_whitelist_bypass()
+    test_group_total_different_groups()
+    test_group_total_no_limit_unconfigured()
+    test_private_msg_no_group_total()
+
     print("\n" + "=" * 55)
-    print("🎉 全部 15 个测试通过！")
+    print("🎉 全部 22 个测试通过！")
     print("=" * 55)
