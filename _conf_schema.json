@@ -1,0 +1,38 @@
+{
+  "max_requests": {
+    "type": "int",
+    "description": "全局默认：时间窗口内允许的最大 LLM 请求次数",
+    "hint": "每个用户在时间窗口内最多可以发送的 LLM 请求数量（全局默认值）",
+    "default": 6
+  },
+  "time_window_seconds": {
+    "type": "int",
+    "description": "时间窗口长度（秒）",
+    "hint": "频率限制的滑动窗口大小，单位为秒",
+    "default": 60
+  },
+  "whitelist": {
+    "type": "list",
+    "description": "白名单用户 ID 列表",
+    "hint": "白名单中的用户不受频率限制。填入用户的 user_id。",
+    "default": []
+  },
+  "group_limits": {
+    "type": "list",
+    "description": "群组自定义频率限制",
+    "hint": "格式: 群组ID:最大次数，如 12345:7 表示群12345限制7次。每行一条。",
+    "default": []
+  },
+  "user_limits": {
+    "type": "list",
+    "description": "用户自定义频率限制",
+    "hint": "格式: 用户ID:最大次数，如 67890:4 表示用户67890限制4次（优先级高于群组限制）。每行一条。",
+    "default": []
+  },
+  "tip_message": {
+    "type": "string",
+    "description": "超限提示消息模板",
+    "hint": "支持变量: {cooldown} 剩余冷却秒数, {max} 最大次数, {window} 窗口秒数",
+    "default": "⚠️ 请求过于频繁，请在 {cooldown} 秒后再试。（限制：{window} 秒内最多 {max} 次）"
+  }
+}

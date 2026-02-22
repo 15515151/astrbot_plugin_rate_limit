@@ -1,0 +1,6 @@
+name: astrbot_plugin_rate_limit
+display_name: LLM 频率限制
+desc: 限制用户请求 LLM 的频率，支持白名单功能。
+version: v1.0.0
+author: Antigravity
+repo: ~
