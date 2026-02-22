@@ -2,7 +2,7 @@ import time
 from collections import defaultdict, deque
 from typing import Dict, Tuple
 
-from astrbot.api import AstrBotConfig
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.event.filter import PermissionType
 from astrbot.api.star import Context, Star
@@ -27,6 +27,14 @@ def _parse_limit_list(raw: list) -> Dict[str, int]:
         except (ValueError, IndexError):
             continue
     return result
+
+def _safe_int(val, default: int) -> int:
+    """安全将配置值转为 int，失败时返回默认值。"""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        logger.warning(f"[rate_limit] 配置值 '{val}' 无法转换为整数，使用默认值 {default}")
+        return default
 
 
 def _dump_limit_dict(d: Dict[str, int]) -> list[str]:
@@ -54,10 +62,11 @@ class RateLimitPlugin(Star):
         """从配置对象加载/重新加载所有参数。"""
         self.enable_user_limit: bool = bool(self.config.get("enable_user_limit", True))
         self.enable_group_total_limit: bool = bool(self.config.get("enable_group_total_limit", True))
-        self.max_requests: int = max(1, int(self.config.get("max_requests", 6)))
-        self.time_window: int = max(1, int(self.config.get("time_window_seconds", 60)))
-        self.default_group_total: int = max(0, int(self.config.get("default_group_total", 0)))
-        self.whitelist: list = self.config.get("whitelist") or []
+        self.max_requests: int = max(1, _safe_int(self.config.get("max_requests", 6), 6))
+        self.time_window: int = max(1, _safe_int(self.config.get("time_window_seconds", 60), 60))
+        self.default_group_total: int = max(0, _safe_int(self.config.get("default_group_total", 0), 0))
+        # 白名单 ID 统一转 str
+        self.whitelist: list[str] = [str(x) for x in (self.config.get("whitelist") or [])]
         self.group_limits: Dict[str, int] = _parse_limit_list(self.config.get("group_limits") or [])
         self.group_total_limits: Dict[str, int] = _parse_limit_list(self.config.get("group_total_limits") or [])
         self.user_limits: Dict[str, int] = _parse_limit_list(self.config.get("user_limits") or [])
@@ -65,6 +74,10 @@ class RateLimitPlugin(Star):
             "⚠️ 请求过于频繁，请在 {cooldown} 秒后再试。（限制：{window} 秒内最多 {max} 次）"
         self.group_tip_message: str = self.config.get("group_tip_message") or \
             "⚠️ 本群请求过于频繁，请在 {cooldown} 秒后再试。（群限制：{window} 秒内合计最多 {max} 次）"
+        logger.debug(f"[rate_limit] 配置已加载: 用户限制={self.enable_user_limit}, "
+                     f"群总量限制={self.enable_group_total_limit}, "
+                     f"每用户={self.max_requests}/{self.time_window}s, "
+                     f"群默认总量={self.default_group_total}")
 
     def _save_limits(self):
         """将所有限制字典序列化后保存到配置。"""
@@ -145,7 +158,7 @@ class RateLimitPlugin(Star):
         3. 群组总量限制（群内所有用户共享计数器）
         两个检查都通过后才记录请求。
         """
-        user_id = event.get_sender_id()
+        user_id = str(event.get_sender_id())
 
         # 白名单用户跳过所有检查
         if user_id in self.whitelist:
@@ -153,6 +166,8 @@ class RateLimitPlugin(Star):
 
         now = time.time()
         group_id = event.get_group_id()
+        if group_id is not None:
+            group_id = str(group_id)
 
         # 定期自动清理过期记录
         self._maybe_auto_cleanup(now)
@@ -165,11 +180,14 @@ class RateLimitPlugin(Star):
                 user_records, max_req, self.time_window, now
             )
             if not allowed:
+                event.stop_event()
                 tip = self.tip_message.format(
                     cooldown=cooldown, max=max_req, window=self.time_window
                 )
-                await event.send(event.plain_result(tip))
-                event.stop_event()
+                try:
+                    await event.send(event.plain_result(tip))
+                except Exception:
+                    logger.warning(f"[rate_limit] 发送用户限流提示失败: user={user_id}")
                 return
 
         # ── 检查 2: 群组总量 ──
@@ -182,11 +200,14 @@ class RateLimitPlugin(Star):
                 group_records, group_max, self.time_window, now
             )
             if not g_allowed:
+                event.stop_event()
                 tip = self.group_tip_message.format(
                     cooldown=g_cooldown, max=group_max, window=self.time_window
                 )
-                await event.send(event.plain_result(tip))
-                event.stop_event()
+                try:
+                    await event.send(event.plain_result(tip))
+                except Exception:
+                    logger.warning(f"[rate_limit] 发送群总量限流提示失败: group={group_id}")
                 return
 
         # ── 两项检查都通过，记录请求 ──
@@ -206,13 +227,8 @@ class RateLimitPlugin(Star):
     async def rl_status(self, event: AstrMessageEvent):
         """查看当前频率限制状态。"""
         self._reload_config()
-        # 先清理过期记录再统计，确保数据准确
-        now = time.time()
-        window_start = now - self.time_window
-        for records in list(self._request_records.values()) + list(self._group_records.values()):
-            while records and records[0] <= window_start:
-                records.popleft()
-        self._cleanup_empty_records()
+        # 复用定时清理逻辑（轻量级，避免每次 status 做重扫描）
+        self._maybe_auto_cleanup(time.time())
         active_users = len(self._request_records)
         active_groups = len(self._group_records)
         gt_default = f"{self.default_group_total} 次" if self.default_group_total > 0 else "不限制"
