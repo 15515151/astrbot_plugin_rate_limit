@@ -22,12 +22,24 @@ def _parse_limit_list(raw: list) -> Dict[str, int]:
             continue
         parts = entry.rsplit(":", 1)
         try:
+            key = parts[0].strip()
             val = int(parts[1].strip())
-            if val > 0:
-                result[parts[0].strip()] = val
+            if key and val > 0:
+                result[key] = val
         except (ValueError, IndexError):
             continue
     return result
+
+
+def _safe_bool(val, default: bool) -> bool:
+    """安全解析布尔配置值，支持字符串 'false'/'0' 等。"""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() not in ('false', '0', 'no', 'off', '')
+    if val is None:
+        return default
+    return bool(val)
 
 def _safe_int(val, default: int) -> int:
     """安全将配置值转为 int，失败时返回默认值。"""
@@ -45,6 +57,7 @@ def _dump_limit_dict(d: Dict[str, int]) -> list[str]:
 
 class RateLimitPlugin(Star):
     _CLEANUP_INTERVAL = 300  # 自动清理间隔（秒）
+    _CLEANUP_BATCH = 200     # 单次清理最多处理的 key 数
     _MAX_DISPLAY = 30        # 列表命令最大显示条数
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -61,8 +74,8 @@ class RateLimitPlugin(Star):
 
     def _reload_config(self):
         """从配置对象加载/重新加载所有参数。"""
-        self.enable_user_limit: bool = bool(self.config.get("enable_user_limit", True))
-        self.enable_group_total_limit: bool = bool(self.config.get("enable_group_total_limit", True))
+        self.enable_user_limit: bool = _safe_bool(self.config.get("enable_user_limit", True), True)
+        self.enable_group_total_limit: bool = _safe_bool(self.config.get("enable_group_total_limit", True), True)
         self.max_requests: int = max(1, _safe_int(self.config.get("max_requests", 6), 6))
         self.time_window: int = max(1, _safe_int(self.config.get("time_window_seconds", 60), 60))
         self.default_group_total: int = max(0, _safe_int(self.config.get("default_group_total", 0), 0))
@@ -137,14 +150,22 @@ class RateLimitPlugin(Star):
                 del d[k]
 
     def _maybe_auto_cleanup(self, now: float):
-        """定期自动清理过期记录和空 key，防止内存膨胀。"""
+        """定期自动清理过期记录和空 key，防止内存膨胀。
+
+        使用 _CLEANUP_BATCH 限制单次清理量，避免事件循环报动。
+        """
         if now - self._last_cleanup < self._CLEANUP_INTERVAL:
             return
         self._last_cleanup = now
         window_start = now - self.time_window
-        for records in list(self._request_records.values()) + list(self._group_records.values()):
-            while records and records[0] <= window_start:
-                records.popleft()
+        budget = self._CLEANUP_BATCH
+        for d in (self._request_records, self._group_records):
+            for records in list(d.values())[:budget]:
+                while records and records[0] <= window_start:
+                    records.popleft()
+            budget -= min(budget, len(d))
+            if budget <= 0:
+                break
         self._cleanup_empty_records()
 
     # ─── Hook: LLM 请求前拦截 ────────────────────────────────────
@@ -182,9 +203,12 @@ class RateLimitPlugin(Star):
             )
             if not allowed:
                 event.stop_event()
-                tip = self.tip_message.format(
-                    cooldown=cooldown, max=max_req, window=self.time_window
-                )
+                try:
+                    tip = self.tip_message.format(
+                        cooldown=cooldown, max=max_req, window=self.time_window
+                    )
+                except (KeyError, ValueError, IndexError):
+                    tip = f"⚠️ 请求过于频繁，请稍后再试。"
                 try:
                     await event.send(event.plain_result(tip))
                 except Exception:
@@ -202,9 +226,12 @@ class RateLimitPlugin(Star):
             )
             if not g_allowed:
                 event.stop_event()
-                tip = self.group_tip_message.format(
-                    cooldown=g_cooldown, max=group_max, window=self.time_window
-                )
+                try:
+                    tip = self.group_tip_message.format(
+                        cooldown=g_cooldown, max=group_max, window=self.time_window
+                    )
+                except (KeyError, ValueError, IndexError):
+                    tip = f"⚠️ 本群请求过于频繁，请稍后再试。"
                 try:
                     await event.send(event.plain_result(tip))
                 except Exception:
@@ -340,6 +367,23 @@ class RateLimitPlugin(Star):
         self._request_records.clear()
         self._group_records.clear()
         yield event.plain_result(f"✅ 时间窗口已设置为 {seconds} 秒（已重置所有计数器）。")
+
+    @rl_group.command("set_gtotal_default")
+    @filter.permission_type(PermissionType.ADMIN)
+    async def rl_set_gtotal_default(self, event: AstrMessageEvent, count: int):
+        """设置全局默认群总量限制。用法: /rl set_gtotal_default <次数> (0=不限制)"""
+        if count < 0:
+            yield event.plain_result("❌ 总次数必须 ≥ 0。")
+            return
+        self.default_group_total = count
+        self.config["default_group_total"] = count
+        self.config.save_config()
+        if count == 0:
+            yield event.plain_result("✅ 已关闭全局默认群总量限制。")
+        else:
+            yield event.plain_result(
+                f"✅ 全局默认群总量已设置为 {count} 次/{self.time_window} 秒（单独配置的群不受影响）。"
+            )
 
     # ── 群组每用户限制管理 ──
 
