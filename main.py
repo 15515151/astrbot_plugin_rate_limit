@@ -1,5 +1,6 @@
 import time
 from collections import defaultdict, deque
+from itertools import islice
 from typing import Dict, Tuple
 
 from astrbot.api import AstrBotConfig, logger
@@ -9,12 +10,19 @@ from astrbot.api.star import Context, Star
 from astrbot.api.provider import ProviderRequest
 
 
-def _parse_limit_list(raw: list) -> Dict[str, int]:
-    """将 ["id:count", ...] 格式的列表解析为 {id: count} 字典。
+def _load_limits(raw) -> Dict[str, int]:
+    """加载限制配置，同时支持字典格式和旧版列表格式。
 
-    使用 rsplit 从右侧分割，确保 ID 中包含冒号时仍能正确解析。
-    自动过滤掉值 <= 0 的非法条目。
+    字典格式: {"id": count, ...}
+    旧版列表格式: ["id:count", ...]
+    自动过滤 key 为空或 value <= 0 的条目。
     """
+    if isinstance(raw, dict):
+        return {str(k): int(v) for k, v in raw.items()
+                if str(k).strip() and _safe_int(v, 0) > 0}
+    if not isinstance(raw, list):
+        return {}
+    # 兼容旧版 ["id:count", ...] 格式
     result = {}
     for entry in raw:
         entry = str(entry).strip()
@@ -50,9 +58,7 @@ def _safe_int(val, default: int) -> int:
         return default
 
 
-def _dump_limit_dict(d: Dict[str, int]) -> list[str]:
-    """将 {id: count} 字典序列化为 ["id:count", ...] 列表。"""
-    return [f"{k}:{v}" for k, v in d.items()]
+
 
 
 class RateLimitPlugin(Star):
@@ -70,7 +76,7 @@ class RateLimitPlugin(Star):
         # 群组级滑动窗口: group_id -> deque[timestamp]
         self._group_records: dict[str, deque[float]] = defaultdict(deque)
         # 上次自动清理时间
-        self._last_cleanup: float = time.time()
+        self._last_cleanup: float = time.monotonic()
 
     def _reload_config(self):
         """从配置对象加载/重新加载所有参数。"""
@@ -81,9 +87,9 @@ class RateLimitPlugin(Star):
         self.default_group_total: int = max(0, _safe_int(self.config.get("default_group_total", 0), 0))
         # 白名单 ID 统一转 str
         self.whitelist: list[str] = [str(x) for x in (self.config.get("whitelist") or [])]
-        self.group_limits: Dict[str, int] = _parse_limit_list(self.config.get("group_limits") or [])
-        self.group_total_limits: Dict[str, int] = _parse_limit_list(self.config.get("group_total_limits") or [])
-        self.user_limits: Dict[str, int] = _parse_limit_list(self.config.get("user_limits") or [])
+        self.group_limits: Dict[str, int] = _load_limits(self.config.get("group_limits") or {})
+        self.group_total_limits: Dict[str, int] = _load_limits(self.config.get("group_total_limits") or {})
+        self.user_limits: Dict[str, int] = _load_limits(self.config.get("user_limits") or {})
         self.tip_message: str = self.config.get("tip_message") or \
             "⚠️ 请求过于频繁，请在 {cooldown} 秒后再试。（限制：{window} 秒内最多 {max} 次）"
         self.group_tip_message: str = self.config.get("group_tip_message") or \
@@ -94,10 +100,10 @@ class RateLimitPlugin(Star):
                      f"群默认总量={self.default_group_total}")
 
     def _save_limits(self):
-        """将所有限制字典序列化后保存到配置。"""
-        self.config["group_limits"] = _dump_limit_dict(self.group_limits)
-        self.config["group_total_limits"] = _dump_limit_dict(self.group_total_limits)
-        self.config["user_limits"] = _dump_limit_dict(self.user_limits)
+        """将所有限制字典直接保存到配置。"""
+        self.config["group_limits"] = dict(self.group_limits)
+        self.config["group_total_limits"] = dict(self.group_total_limits)
+        self.config["user_limits"] = dict(self.user_limits)
         self.config.save_config()
 
     # ─── 核心逻辑 ────────────────────────────────────────────────
@@ -160,7 +166,7 @@ class RateLimitPlugin(Star):
         window_start = now - self.time_window
         budget = self._CLEANUP_BATCH
         for d in (self._request_records, self._group_records):
-            for records in list(d.values())[:budget]:
+            for records in islice(d.values(), budget):
                 while records and records[0] <= window_start:
                     records.popleft()
             budget -= min(budget, len(d))
@@ -186,7 +192,7 @@ class RateLimitPlugin(Star):
         if user_id in self.whitelist:
             return
 
-        now = time.time()
+        now = time.monotonic()
         group_id = event.get_group_id()
         if group_id is not None:
             group_id = str(group_id)
@@ -255,7 +261,7 @@ class RateLimitPlugin(Star):
     async def rl_status(self, event: AstrMessageEvent):
         """查看当前频率限制状态。"""
         # 复用定时清理逻辑
-        self._maybe_auto_cleanup(time.time())
+        self._maybe_auto_cleanup(time.monotonic())
         active_users = len(self._request_records)
         active_groups = len(self._group_records)
         gt_default = f"{self.default_group_total} 次" if self.default_group_total > 0 else "不限制"
