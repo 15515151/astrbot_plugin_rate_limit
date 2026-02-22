@@ -57,7 +57,7 @@
     "type": "string",
     "description": "超限提示消息模板",
     "hint": "支持变量: {cooldown} 剩余冷却秒数, {max} 最大次数, {window} 窗口秒数",
-    "default": "⚠️ 请求过于频繁，请在 {cooldown} 秒后再试。（限制：{window} 秒内最多 {max} 次）"
+    "default": "⚠️ 请求过于频繁，请在 {cooldown} 秒后再试。（限制：单个用户{window} 秒内最多 {max} 次）"
   },
   "group_tip_message": {
     "type": "string",
