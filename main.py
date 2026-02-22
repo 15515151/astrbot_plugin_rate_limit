@@ -17,7 +17,7 @@ def _load_limits(raw) -> dict[str, int]:
     自动过滤 key 为空或 value <= 0 的条目。
     """
     if isinstance(raw, dict):
-        return {str(k): int(v) for k, v in raw.items()
+        return {str(k).strip(): int(v) for k, v in raw.items()
                 if str(k).strip() and _safe_int(v, 0) > 0}
     if not isinstance(raw, list):
         return {}
@@ -76,6 +76,8 @@ class RateLimitPlugin(Star):
         self._group_records: dict[str, deque[float]] = defaultdict(deque)
         # 上次自动清理时间
         self._last_cleanup: float = time.monotonic()
+        # 清理游标：在多轮清理中轮转遍历所有 key
+        self._cleanup_cursor: int = 0
 
     def _reload_config(self):
         """从配置对象加载/重新加载所有参数。"""
@@ -84,8 +86,8 @@ class RateLimitPlugin(Star):
         self.max_requests: int = max(1, _safe_int(self.config.get("max_requests", 6), 6))
         self.time_window: int = max(1, _safe_int(self.config.get("time_window_seconds", 60), 60))
         self.default_group_total: int = max(0, _safe_int(self.config.get("default_group_total", 0), 0))
-        # 白名单 ID 统一转 str
-        self.whitelist: list[str] = [str(x) for x in (self.config.get("whitelist") or [])]
+        # 白名单 ID 统一转 str 并去重
+        self.whitelist: set[str] = {str(x).strip() for x in (self.config.get("whitelist") or []) if str(x).strip()}
         self.group_limits: dict[str, int] = _load_limits(self.config.get("group_limits") or {})
         self.group_total_limits: dict[str, int] = _load_limits(self.config.get("group_total_limits") or {})
         self.user_limits: dict[str, int] = _load_limits(self.config.get("user_limits") or {})
@@ -99,11 +101,23 @@ class RateLimitPlugin(Star):
                      f"群默认总量={self.default_group_total}")
 
     def _save_limits(self):
-        """将所有限制字典直接保存到配置。"""
+        """将所有限制字典直接保存到配置。保存失败时回滚内存状态。"""
+        backup = (
+            self.config.get("group_limits"),
+            self.config.get("group_total_limits"),
+            self.config.get("user_limits"),
+        )
         self.config["group_limits"] = dict(self.group_limits)
         self.config["group_total_limits"] = dict(self.group_total_limits)
         self.config["user_limits"] = dict(self.user_limits)
-        self.config.save_config()
+        try:
+            self.config.save_config()
+        except Exception as e:
+            # 回滚
+            self.config["group_limits"], self.config["group_total_limits"], self.config["user_limits"] = backup
+            self._reload_config()
+            logger.error(f"[rate_limit] 保存配置失败，已回滚: {e}")
+            raise
 
     # ─── 核心逻辑 ────────────────────────────────────────────────
 
@@ -147,31 +161,41 @@ class RateLimitPlugin(Star):
         """记录一次请求时间戳。"""
         records.append(now)
 
-    def _cleanup_empty_records(self):
-        """清理空的滑动窗口记录，回收内存。"""
-        for d in (self._request_records, self._group_records):
-            empty_keys = [k for k, v in d.items() if not v]
-            for k in empty_keys:
-                del d[k]
-
     def _maybe_auto_cleanup(self, now: float):
         """定期自动清理过期记录和空 key，防止内存膨胀。
 
-        使用 _CLEANUP_BATCH 限制单次清理量，避免事件循环报动。
+        使用游标轮转 + 批量限制，确保所有 key 在多轮内都能被覆盖。
+        空 key 在遍历中即时删除，避免额外全量扫描。
         """
         if now - self._last_cleanup < self._CLEANUP_INTERVAL:
             return
         self._last_cleanup = now
         window_start = now - self.time_window
         budget = self._CLEANUP_BATCH
+
         for d in (self._request_records, self._group_records):
-            for records in islice(d.values(), budget):
+            keys = list(d.keys())
+            if not keys:
+                continue
+            total = len(keys)
+            start = self._cleanup_cursor % total if total else 0
+            # 从游标位置开始轮转遍历
+            indices = list(range(start, total)) + list(range(0, start))
+            to_delete = []
+            for idx in indices[:budget]:
+                k = keys[idx]
+                records = d[k]
                 while records and records[0] <= window_start:
                     records.popleft()
-            budget -= min(budget, len(d))
+                if not records:
+                    to_delete.append(k)
+            for k in to_delete:
+                del d[k]
+            budget -= min(budget, len(indices))
             if budget <= 0:
                 break
-        self._cleanup_empty_records()
+
+        self._cleanup_cursor += self._CLEANUP_BATCH
 
     # ─── Hook: LLM 请求前拦截 ────────────────────────────────────
 
@@ -310,24 +334,39 @@ class RateLimitPlugin(Star):
     @filter.permission_type(PermissionType.ADMIN)
     async def rl_whitelist_add(self, event: AstrMessageEvent, user_id: str):
         """添加用户到白名单。"""
+        user_id = user_id.strip()
+        if not user_id:
+            yield event.plain_result("❌ 用户 ID 不能为空。")
+            return
         if user_id in self.whitelist:
             yield event.plain_result(f"ℹ️ 用户 {user_id} 已在白名单中。")
             return
-        self.whitelist.append(user_id)
-        self.config["whitelist"] = self.whitelist
-        self.config.save_config()
+        self.whitelist.add(user_id)
+        self.config["whitelist"] = list(self.whitelist)
+        try:
+            self.config.save_config()
+        except Exception:
+            self.whitelist.discard(user_id)
+            yield event.plain_result("❌ 保存配置失败。")
+            return
         yield event.plain_result(f"✅ 已将用户 {user_id} 添加到白名单。")
 
     @rl_group.command("wl_del")
     @filter.permission_type(PermissionType.ADMIN)
     async def rl_whitelist_remove(self, event: AstrMessageEvent, user_id: str):
         """从白名单移除用户。"""
+        user_id = user_id.strip()
         if user_id not in self.whitelist:
             yield event.plain_result(f"ℹ️ 用户 {user_id} 不在白名单中。")
             return
-        self.whitelist.remove(user_id)
-        self.config["whitelist"] = self.whitelist
-        self.config.save_config()
+        self.whitelist.discard(user_id)
+        self.config["whitelist"] = list(self.whitelist)
+        try:
+            self.config.save_config()
+        except Exception:
+            self.whitelist.add(user_id)
+            yield event.plain_result("❌ 保存配置失败。")
+            return
         self._request_records.pop(user_id, None)
         yield event.plain_result(f"✅ 已将用户 {user_id} 从白名单移除。")
 
@@ -338,11 +377,12 @@ class RateLimitPlugin(Star):
         if not self.whitelist:
             yield event.plain_result("📋 白名单为空。")
             return
+        wl = sorted(self.whitelist)
         lines = ["📋 白名单用户列表:"]
-        for i, uid in enumerate(self.whitelist[:self._MAX_DISPLAY], 1):
+        for i, uid in enumerate(wl[:self._MAX_DISPLAY], 1):
             lines.append(f"  {i}. {uid}")
-        if len(self.whitelist) > self._MAX_DISPLAY:
-            lines.append(f"  ... 省略 {len(self.whitelist) - self._MAX_DISPLAY} 人")
+        if len(wl) > self._MAX_DISPLAY:
+            lines.append(f"  ... 省略 {len(wl) - self._MAX_DISPLAY} 人")
         yield event.plain_result("\n".join(lines))
 
     # ── 全局参数设置 ──
@@ -396,11 +436,20 @@ class RateLimitPlugin(Star):
     @filter.permission_type(PermissionType.ADMIN)
     async def rl_group_set(self, event: AstrMessageEvent, group_id: str, count: int):
         """为群组设置每用户频率限制。用法: /rl group_set <群组ID> <次数>"""
+        group_id = group_id.strip()
+        if not group_id:
+            yield event.plain_result("❌ 群组 ID 不能为空。")
+            return
         if count < 1:
             yield event.plain_result("❌ 最大请求次数必须 ≥ 1。")
             return
         self.group_limits[group_id] = count
-        self._save_limits()
+        try:
+            self._save_limits()
+        except Exception:
+            self.group_limits.pop(group_id, None)
+            yield event.plain_result("❌ 保存配置失败。")
+            return
         yield event.plain_result(f"✅ 群组 {group_id} 的每用户限制已设置为 {count} 次/{self.time_window} 秒。")
 
     @rl_group.command("group_del")
@@ -435,11 +484,20 @@ class RateLimitPlugin(Star):
     @filter.permission_type(PermissionType.ADMIN)
     async def rl_gtotal_set(self, event: AstrMessageEvent, group_id: str, count: int):
         """为群组设置总请求次数限制。用法: /rl gtotal_set <群组ID> <总次数>"""
+        group_id = group_id.strip()
+        if not group_id:
+            yield event.plain_result("❌ 群组 ID 不能为空。")
+            return
         if count < 1:
             yield event.plain_result("❌ 总次数必须 ≥ 1。")
             return
         self.group_total_limits[group_id] = count
-        self._save_limits()
+        try:
+            self._save_limits()
+        except Exception:
+            self.group_total_limits.pop(group_id, None)
+            yield event.plain_result("❌ 保存配置失败。")
+            return
         yield event.plain_result(
             f"✅ 群组 {group_id} 的总量限制已设置为 {count} 次/{self.time_window} 秒（全群共享）。"
         )
@@ -479,11 +537,20 @@ class RateLimitPlugin(Star):
     @filter.permission_type(PermissionType.ADMIN)
     async def rl_user_set(self, event: AstrMessageEvent, user_id: str, count: int):
         """为用户设置自定义频率限制（优先级最高）。用法: /rl user_set <用户ID> <次数>"""
+        user_id = user_id.strip()
+        if not user_id:
+            yield event.plain_result("❌ 用户 ID 不能为空。")
+            return
         if count < 1:
             yield event.plain_result("❌ 最大请求次数必须 ≥ 1。")
             return
         self.user_limits[user_id] = count
-        self._save_limits()
+        try:
+            self._save_limits()
+        except Exception:
+            self.user_limits.pop(user_id, None)
+            yield event.plain_result("❌ 保存配置失败。")
+            return
         self._request_records.pop(user_id, None)
         yield event.plain_result(f"✅ 用户 {user_id} 的频率限制已设置为 {count} 次/{self.time_window} 秒。")
 
