@@ -11,7 +11,8 @@ from astrbot.api.provider import ProviderRequest
 
 def _parse_limit_list(raw: list) -> Dict[str, int]:
     """将 ["id:count", ...] 格式的列表解析为 {id: count} 字典。
-    
+
+    使用 rsplit 从右侧分割，确保 ID 中包含冒号时仍能正确解析。
     自动过滤掉值 <= 0 的非法条目。
     """
     result = {}
@@ -19,7 +20,7 @@ def _parse_limit_list(raw: list) -> Dict[str, int]:
         entry = str(entry).strip()
         if ":" not in entry:
             continue
-        parts = entry.split(":", 1)
+        parts = entry.rsplit(":", 1)
         try:
             val = int(parts[1].strip())
             if val > 0:
@@ -43,8 +44,8 @@ def _dump_limit_dict(d: Dict[str, int]) -> list[str]:
 
 
 class RateLimitPlugin(Star):
-    # 自动清理间隔（秒）
-    _CLEANUP_INTERVAL = 300  # 5 分钟
+    _CLEANUP_INTERVAL = 300  # 自动清理间隔（秒）
+    _MAX_DISPLAY = 30        # 列表命令最大显示条数
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -226,8 +227,7 @@ class RateLimitPlugin(Star):
     @filter.permission_type(PermissionType.ADMIN)
     async def rl_status(self, event: AstrMessageEvent):
         """查看当前频率限制状态。"""
-        self._reload_config()
-        # 复用定时清理逻辑（轻量级，避免每次 status 做重扫描）
+        # 复用定时清理逻辑
         self._maybe_auto_cleanup(time.time())
         active_users = len(self._request_records)
         active_groups = len(self._group_records)
@@ -249,18 +249,27 @@ class RateLimitPlugin(Star):
         ]
         if self.group_limits:
             lines.append("  📁 群组每用户限制:")
-            for gid, limit in self.group_limits.items():
+            items = list(self.group_limits.items())
+            for gid, limit in items[:self._MAX_DISPLAY]:
                 lines.append(f"    · {gid}: {limit} 次/人")
+            if len(items) > self._MAX_DISPLAY:
+                lines.append(f"    ... 省略 {len(items) - self._MAX_DISPLAY} 条")
         if self.group_total_limits:
             lines.append("  🏢 群组总量限制:")
-            for gid, limit in self.group_total_limits.items():
+            items = list(self.group_total_limits.items())
+            for gid, limit in items[:self._MAX_DISPLAY]:
                 grp_records = self._group_records.get(gid)
                 used = len(grp_records) if grp_records else 0
                 lines.append(f"    · {gid}: {limit} 次（已用 {used}）")
+            if len(items) > self._MAX_DISPLAY:
+                lines.append(f"    ... 省略 {len(items) - self._MAX_DISPLAY} 条")
         if self.user_limits:
             lines.append("  👤 用户限制:")
-            for uid, limit in self.user_limits.items():
+            items = list(self.user_limits.items())
+            for uid, limit in items[:self._MAX_DISPLAY]:
                 lines.append(f"    · {uid}: {limit} 次")
+            if len(items) > self._MAX_DISPLAY:
+                lines.append(f"    ... 省略 {len(items) - self._MAX_DISPLAY} 条")
         yield event.plain_result("\n".join(lines))
 
     # ── 白名单管理 ──
@@ -294,13 +303,14 @@ class RateLimitPlugin(Star):
     @filter.permission_type(PermissionType.ADMIN)
     async def rl_whitelist_list(self, event: AstrMessageEvent):
         """查看白名单列表。"""
-        self._reload_config()
         if not self.whitelist:
             yield event.plain_result("📋 白名单为空。")
             return
         lines = ["📋 白名单用户列表:"]
-        for i, uid in enumerate(self.whitelist, 1):
+        for i, uid in enumerate(self.whitelist[:self._MAX_DISPLAY], 1):
             lines.append(f"  {i}. {uid}")
+        if len(self.whitelist) > self._MAX_DISPLAY:
+            lines.append(f"  ... 省略 {len(self.whitelist) - self._MAX_DISPLAY} 人")
         yield event.plain_result("\n".join(lines))
 
     # ── 全局参数设置 ──
@@ -359,13 +369,15 @@ class RateLimitPlugin(Star):
     @filter.permission_type(PermissionType.ADMIN)
     async def rl_group_list(self, event: AstrMessageEvent):
         """查看所有群组自定义限制。"""
-        self._reload_config()
         if not self.group_limits:
             yield event.plain_result("📁 没有群组每用户自定义限制。")
             return
         lines = [f"📁 群组每用户限制 (默认: {self.max_requests} 次):"]
-        for gid, limit in self.group_limits.items():
+        items = list(self.group_limits.items())
+        for gid, limit in items[:self._MAX_DISPLAY]:
             lines.append(f"  · {gid}: {limit} 次/{self.time_window} 秒")
+        if len(items) > self._MAX_DISPLAY:
+            lines.append(f"  ... 省略 {len(items) - self._MAX_DISPLAY} 条")
         yield event.plain_result("\n".join(lines))
 
     # ── 群组总量限制管理 ──
@@ -399,15 +411,17 @@ class RateLimitPlugin(Star):
     @filter.permission_type(PermissionType.ADMIN)
     async def rl_gtotal_list(self, event: AstrMessageEvent):
         """查看所有群组总量限制。"""
-        self._reload_config()
         if not self.group_total_limits:
             yield event.plain_result("🏢 没有群组总量限制。")
             return
         lines = ["🏢 群组总量限制:"]
-        for gid, limit in self.group_total_limits.items():
+        items = list(self.group_total_limits.items())
+        for gid, limit in items[:self._MAX_DISPLAY]:
             grp_records = self._group_records.get(gid)
             used = len(grp_records) if grp_records else 0
             lines.append(f"  · {gid}: {limit} 次/{self.time_window} 秒（已用 {used}）")
+        if len(items) > self._MAX_DISPLAY:
+            lines.append(f"  ... 省略 {len(items) - self._MAX_DISPLAY} 条")
         yield event.plain_result("\n".join(lines))
 
     # ── 用户限制管理 ──
@@ -439,11 +453,13 @@ class RateLimitPlugin(Star):
     @filter.permission_type(PermissionType.ADMIN)
     async def rl_user_list(self, event: AstrMessageEvent):
         """查看所有用户的自定义频率限制。"""
-        self._reload_config()
         if not self.user_limits:
             yield event.plain_result("👤 没有用户自定义限制。")
             return
         lines = ["👤 用户自定义限制 (优先级最高):"]
-        for uid, limit in self.user_limits.items():
+        items = list(self.user_limits.items())
+        for uid, limit in items[:self._MAX_DISPLAY]:
             lines.append(f"  · {uid}: {limit} 次/{self.time_window} 秒")
+        if len(items) > self._MAX_DISPLAY:
+            lines.append(f"  ... 省略 {len(items) - self._MAX_DISPLAY} 条")
         yield event.plain_result("\n".join(lines))
