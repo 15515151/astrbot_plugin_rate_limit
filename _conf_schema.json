@@ -1,4 +1,16 @@
 {
+  "enable_user_limit": {
+    "type": "bool",
+    "description": "启用个人频率限制",
+    "hint": "关闭后所有用户不受个人频率限制（用户级和群组每用户级都不生效）",
+    "default": true
+  },
+  "enable_group_total_limit": {
+    "type": "bool",
+    "description": "启用群组总量限制",
+    "hint": "关闭后所有群不受群总量限制（default_group_total 和 group_total_limits 都不生效）",
+    "default": true
+  },
   "max_requests": {
     "type": "int",
     "description": "全局默认：时间窗口内每个用户允许的最大 LLM 请求次数",
@@ -10,6 +22,12 @@
     "description": "时间窗口长度（秒）",
     "hint": "频率限制的滑动窗口大小，单位为秒",
     "default": 60
+  },
+  "default_group_total": {
+    "type": "int",
+    "description": "全局默认：每个群在时间窗口内允许的总 LLM 请求次数（所有用户合计）",
+    "hint": "设为 0 表示不限制群总量。设置后所有群都会受此限制，个别群可通过 group_total_limits 单独覆盖。",
+    "default": 0
   },
   "whitelist": {
     "type": "list",

@@ -43,8 +43,11 @@ class RateLimitPlugin(Star):
 
     def _reload_config(self):
         """从配置对象加载/重新加载所有参数。"""
+        self.enable_user_limit: bool = self.config.get("enable_user_limit", True)
+        self.enable_group_total_limit: bool = self.config.get("enable_group_total_limit", True)
         self.max_requests: int = self.config.get("max_requests", 6)
         self.time_window: int = self.config.get("time_window_seconds", 60)
+        self.default_group_total: int = self.config.get("default_group_total", 0)
         self.whitelist: list = self.config.get("whitelist", [])
         self.group_limits: Dict[str, int] = _parse_limit_list(self.config.get("group_limits", []))
         self.group_total_limits: Dict[str, int] = _parse_limit_list(self.config.get("group_total_limits", []))
@@ -77,6 +80,16 @@ class RateLimitPlugin(Star):
         if group_id and group_id in self.group_limits:
             return self.group_limits[group_id]
         return self.max_requests
+
+    def _resolve_group_total(self, group_id: str) -> int:
+        """解析群组的总量限制。
+
+        优先级: 群组自定义总量 > 全局默认群总量
+        返回 0 表示不限制。
+        """
+        if group_id in self.group_total_limits:
+            return self.group_total_limits[group_id]
+        return self.default_group_total
 
     @staticmethod
     def _sliding_window_check(records: deque, max_req: int, time_window: int,
@@ -117,22 +130,25 @@ class RateLimitPlugin(Star):
         group_id = event.get_group_id()
 
         # ── 检查 1: 用户级频率 ──
-        max_req = self._resolve_max_requests(user_id, group_id)
-        user_records = self._request_records[user_id]
-        allowed, cooldown = self._sliding_window_check(
-            user_records, max_req, self.time_window, now
-        )
-        if not allowed:
-            tip = self.tip_message.format(
-                cooldown=cooldown, max=max_req, window=self.time_window
+        if self.enable_user_limit:
+            max_req = self._resolve_max_requests(user_id, group_id)
+            user_records = self._request_records[user_id]
+            allowed, cooldown = self._sliding_window_check(
+                user_records, max_req, self.time_window, now
             )
-            await event.send(event.plain_result(tip))
-            event.stop_event()
-            return
+            if not allowed:
+                tip = self.tip_message.format(
+                    cooldown=cooldown, max=max_req, window=self.time_window
+                )
+                await event.send(event.plain_result(tip))
+                event.stop_event()
+                return
 
         # ── 检查 2: 群组总量 ──
-        if group_id and group_id in self.group_total_limits:
-            group_max = self.group_total_limits[group_id]
+        group_max = 0
+        if self.enable_group_total_limit and group_id:
+            group_max = self._resolve_group_total(group_id)
+        if group_id and group_max > 0:
             group_records = self._group_records[group_id]
             g_allowed, g_cooldown = self._sliding_window_check(
                 group_records, group_max, self.time_window, now
@@ -146,8 +162,9 @@ class RateLimitPlugin(Star):
                 return
 
         # ── 两项检查都通过，记录请求 ──
-        self._sliding_window_record(user_records, now)
-        if group_id and group_id in self.group_total_limits:
+        if self.enable_user_limit:
+            self._sliding_window_record(self._request_records[user_id], now)
+        if group_id and group_max > 0:
             self._sliding_window_record(self._group_records[group_id], now)
 
     # ─── 管理指令组 /rl ──────────────────────────────────────────
@@ -163,11 +180,17 @@ class RateLimitPlugin(Star):
         self._reload_config()
         active_users = sum(1 for q in self._request_records.values() if q)
         active_groups = sum(1 for q in self._group_records.values() if q)
+        gt_default = f"{self.default_group_total} 次" if self.default_group_total > 0 else "不限制"
+        ul_status = "✅ 开启" if self.enable_user_limit else "❌ 关闭"
+        gl_status = "✅ 开启" if self.enable_group_total_limit else "❌ 关闭"
         lines = [
             "📊 LLM 频率限制状态",
-            f"├ 全局默认: {self.max_requests} 次/{self.time_window} 秒（每用户）",
+            f"├ 个人限制: {ul_status}",
+            f"├ 群总量限制: {gl_status}",
+            f"├ 全局每用户默认: {self.max_requests} 次/{self.time_window} 秒",
+            f"├ 全局群总量默认: {gt_default}/{self.time_window} 秒",
             f"├ 群组每用户自定义: {len(self.group_limits)} 个",
-            f"├ 群组总量限制: {len(self.group_total_limits)} 个",
+            f"├ 群组总量自定义: {len(self.group_total_limits)} 个",
             f"├ 用户自定义: {len(self.user_limits)} 个",
             f"├ 白名单人数: {len(self.whitelist)}",
             f"├ 当前活跃用户数: {active_users}",

@@ -12,10 +12,12 @@ from typing import Dict, List, Tuple
 class RateLimiter:
     """从 main.py 提取的纯逻辑，用于独立测试。"""
 
-    def __init__(self, max_requests=6, time_window=60, group_limits=None,
-                 group_total_limits=None, user_limits=None, whitelist=None):
+    def __init__(self, max_requests=6, time_window=60, default_group_total=0,
+                 group_limits=None, group_total_limits=None,
+                 user_limits=None, whitelist=None):
         self.max_requests = max_requests
         self.time_window = time_window
+        self.default_group_total = default_group_total
         self.group_limits: dict = group_limits or {}
         self.group_total_limits: dict = group_total_limits or {}
         self.user_limits: dict = user_limits or {}
@@ -29,6 +31,11 @@ class RateLimiter:
         if group_id and group_id in self.group_limits:
             return int(self.group_limits[group_id])
         return self.max_requests
+
+    def _resolve_group_total(self, group_id: str) -> int:
+        if group_id in self.group_total_limits:
+            return self.group_total_limits[group_id]
+        return self.default_group_total
 
     @staticmethod
     def _sw_check(records: deque, max_req: int, time_window: int,
@@ -57,16 +64,16 @@ class RateLimiter:
             return False, cd, "user_limit"
 
         # 群组总量检查
-        if group_id and group_id in self.group_total_limits:
-            g_max = self.group_total_limits[group_id]
+        group_max = self._resolve_group_total(group_id) if group_id else 0
+        if group_id and group_max > 0:
             g_records = self._group_records[group_id]
-            g_allowed, g_cd = self._sw_check(g_records, g_max, self.time_window, now)
+            g_allowed, g_cd = self._sw_check(g_records, group_max, self.time_window, now)
             if not g_allowed:
                 return False, g_cd, "group_total"
 
         # 都通过，记录
         user_records.append(now)
-        if group_id and group_id in self.group_total_limits:
+        if group_id and group_max > 0:
             self._group_records[group_id].append(now)
 
         return True, 0.0, "ok"
@@ -322,14 +329,64 @@ def test_private_msg_no_group_total():
     print("✅ test_private_msg_no_group_total")
 
 
+# ═══════════════════════════════════════════════════
+# 全局默认群总量限制
+# ═══════════════════════════════════════════════════
+
+def test_default_group_total_basic():
+    """default_group_total 让所有群都受群总量限制"""
+    rl = RateLimiter(max_requests=10, time_window=60, default_group_total=3)
+    # 任意群 g_any，3 个用户各 1 次 → 满
+    assert rl.request("a", group_id="g_any", now=0.0)[0] is True
+    assert rl.request("b", group_id="g_any", now=1.0)[0] is True
+    assert rl.request("c", group_id="g_any", now=2.0)[0] is True
+    ok, _, reason = rl.request("d", group_id="g_any", now=3.0)
+    assert not ok and reason == "group_total"
+    # 另一个群 g_other 也受限
+    assert rl.request("x", group_id="g_other", now=0.0)[0] is True
+    assert rl.request("y", group_id="g_other", now=1.0)[0] is True
+    assert rl.request("z", group_id="g_other", now=2.0)[0] is True
+    ok2, _, reason2 = rl.request("w", group_id="g_other", now=3.0)
+    assert not ok2 and reason2 == "group_total"
+    print("OK test_default_group_total_basic")
+
+
+def test_default_group_total_override():
+    """group_total_limits 覆盖 default_group_total"""
+    rl = RateLimiter(max_requests=10, time_window=60,
+                     default_group_total=3,
+                     group_total_limits={"vip_g": 10})
+    # 普通群受默认限制 3
+    for i in range(3):
+        rl.request(f"u{i}", group_id="normal_g", now=float(i))
+    assert rl.request("u3", group_id="normal_g", now=3.0)[0] is False
+    # vip_g 被覆盖为 10
+    for i in range(10):
+        ok, _, _ = rl.request(f"v{i}", group_id="vip_g", now=float(i))
+        assert ok
+    ok2, _, reason = rl.request("v10", group_id="vip_g", now=10.0)
+    assert not ok2 and reason == "group_total"
+    print("OK test_default_group_total_override")
+
+
+def test_default_group_total_private_bypass():
+    """私聊不受 default_group_total 影响"""
+    rl = RateLimiter(max_requests=5, time_window=60, default_group_total=2)
+    for i in range(5):
+        assert rl.request("u", group_id=None, now=float(i))[0] is True
+    assert rl.request("u", group_id=None, now=5.0)[0] is False  # 只受用户级
+    print("OK test_default_group_total_private_bypass")
+
+
+
 if __name__ == "__main__":
     print("=" * 55)
-    print("🧪 AstrBot Rate Limit Plugin - 单元测试 v1.2")
+    print("Tests v1.3")
     print("=" * 55)
 
-    s = lambda t: print(f"\n── {t} ──")
+    s = lambda t: print(f"\n-- {t} --")
 
-    s("基础测试")
+    s("basic")
     test_basic_allow()
     test_exceed_limit()
     test_window_expiry()
@@ -338,17 +395,17 @@ if __name__ == "__main__":
     test_cooldown_accuracy()
     test_rapid_burst()
 
-    s("群组每用户限制")
+    s("group per-user")
     test_group_per_user_limit()
     test_group_default_fallback()
     test_group_higher_limit()
 
-    s("用户自定义限制 + 优先级")
+    s("user override + priority")
     test_user_limit()
     test_user_overrides_group()
     test_full_priority_chain()
 
-    s("群组总量限制")
+    s("group total (specific)")
     test_group_total_basic()
     test_group_total_mixed_users()
     test_group_total_window_expiry()
@@ -358,6 +415,11 @@ if __name__ == "__main__":
     test_group_total_no_limit_unconfigured()
     test_private_msg_no_group_total()
 
+    s("default group total")
+    test_default_group_total_basic()
+    test_default_group_total_override()
+    test_default_group_total_private_bypass()
+
     print("\n" + "=" * 55)
-    print("🎉 全部 22 个测试通过！")
+    print("ALL 25 TESTS PASSED!")
     print("=" * 55)
