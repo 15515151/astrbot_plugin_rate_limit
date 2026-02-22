@@ -1,13 +1,6 @@
-{
-  "name": "astrbot_plugin_rate_limit",
-  "display_name": "LLM 频率限制",
-  "desc": "限制用户及群组请求 LLM 的频率，防止滥用。支持个人限频、群限频、白名单，滑动窗口算法，WebUI 可视化配置，管理员指令动态调整。",
-  "author": "\tAntigravity&15515151",
-  "repo": "https://github.com/15515151/astrbot_plugin_rate_limit",
-  "tags": [
-    "频率限制",
-    "限流",
-    "管理"
-  ],
-  "social_link": "https://github.com/15515151"
-}
+"name": astrbot_plugin_rate_limit
+"display_name": LLM 频率限制
+"desc": 限制用户及群组请求 LLM 的频率，防止滥用。支持个人限频、群限频、白名单，滑动窗口算法，WebUI 可视化配置，管理员指令动态调整。
+"author": Antigravity&15515151
+"repo": https://github.com/15515151/astrbot_plugin_rate_limit
+social_link": https://github.com/15515151
