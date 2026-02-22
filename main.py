@@ -1,7 +1,6 @@
 import time
 from collections import defaultdict, deque
 from itertools import islice
-from typing import Dict, Tuple
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import filter, AstrMessageEvent
@@ -10,7 +9,7 @@ from astrbot.api.star import Context, Star
 from astrbot.api.provider import ProviderRequest
 
 
-def _load_limits(raw) -> Dict[str, int]:
+def _load_limits(raw) -> dict[str, int]:
     """加载限制配置，同时支持字典格式和旧版列表格式。
 
     字典格式: {"id": count, ...}
@@ -87,9 +86,9 @@ class RateLimitPlugin(Star):
         self.default_group_total: int = max(0, _safe_int(self.config.get("default_group_total", 0), 0))
         # 白名单 ID 统一转 str
         self.whitelist: list[str] = [str(x) for x in (self.config.get("whitelist") or [])]
-        self.group_limits: Dict[str, int] = _load_limits(self.config.get("group_limits") or {})
-        self.group_total_limits: Dict[str, int] = _load_limits(self.config.get("group_total_limits") or {})
-        self.user_limits: Dict[str, int] = _load_limits(self.config.get("user_limits") or {})
+        self.group_limits: dict[str, int] = _load_limits(self.config.get("group_limits") or {})
+        self.group_total_limits: dict[str, int] = _load_limits(self.config.get("group_total_limits") or {})
+        self.user_limits: dict[str, int] = _load_limits(self.config.get("user_limits") or {})
         self.tip_message: str = self.config.get("tip_message") or \
             "⚠️ 请求过于频繁，请在 {cooldown} 秒后再试。（限制：{window} 秒内最多 {max} 次）"
         self.group_tip_message: str = self.config.get("group_tip_message") or \
@@ -131,7 +130,7 @@ class RateLimitPlugin(Star):
 
     @staticmethod
     def _sliding_window_check(records: deque, max_req: int, time_window: int,
-                              now: float) -> Tuple[bool, float]:
+                              now: float) -> tuple[bool, float]:
         """通用滑动窗口检查（不记录，仅判断 + 返回冷却时间）。"""
         if max_req <= 0:
             return False, 0.0
@@ -216,7 +215,7 @@ class RateLimitPlugin(Star):
                 except (KeyError, ValueError, IndexError):
                     tip = f"⚠️ 请求过于频繁，请稍后再试。"
                 try:
-                    await event.send(event.plain_result(tip))
+                    await event.send(tip)
                 except Exception:
                     logger.warning(f"[rate_limit] 发送用户限流提示失败: user={user_id}")
                 return
@@ -239,7 +238,7 @@ class RateLimitPlugin(Star):
                 except (KeyError, ValueError, IndexError):
                     tip = f"⚠️ 本群请求过于频繁，请稍后再试。"
                 try:
-                    await event.send(event.plain_result(tip))
+                    await event.send(tip)
                 except Exception:
                     logger.warning(f"[rate_limit] 发送群总量限流提示失败: group={group_id}")
                 return
