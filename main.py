@@ -1,16 +1,19 @@
 import time
 from collections import defaultdict, deque
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.event.filter import EventMessageType, PermissionType
+from astrbot.api.event.filter import PermissionType
 from astrbot.api.star import Context, Star, register
 from astrbot.api.provider import ProviderRequest
 
 
 def _parse_limit_list(raw: list) -> Dict[str, int]:
-    """将 ["id:count", ...] 格式的列表解析为 {id: count} 字典。"""
+    """将 ["id:count", ...] 格式的列表解析为 {id: count} 字典。
+    
+    自动过滤掉值 <= 0 的非法条目。
+    """
     result = {}
     for entry in raw:
         entry = str(entry).strip()
@@ -18,13 +21,15 @@ def _parse_limit_list(raw: list) -> Dict[str, int]:
             continue
         parts = entry.split(":", 1)
         try:
-            result[parts[0].strip()] = int(parts[1].strip())
+            val = int(parts[1].strip())
+            if val > 0:
+                result[parts[0].strip()] = val
         except (ValueError, IndexError):
             continue
     return result
 
 
-def _dump_limit_dict(d: Dict[str, int]) -> List[str]:
+def _dump_limit_dict(d: Dict[str, int]) -> list[str]:
     """将 {id: count} 字典序列化为 ["id:count", ...] 列表。"""
     return [f"{k}:{v}" for k, v in d.items()]
 
@@ -43,11 +48,11 @@ class RateLimitPlugin(Star):
 
     def _reload_config(self):
         """从配置对象加载/重新加载所有参数。"""
-        self.enable_user_limit: bool = self.config.get("enable_user_limit", True)
-        self.enable_group_total_limit: bool = self.config.get("enable_group_total_limit", True)
-        self.max_requests: int = self.config.get("max_requests", 6)
-        self.time_window: int = self.config.get("time_window_seconds", 60)
-        self.default_group_total: int = self.config.get("default_group_total", 0)
+        self.enable_user_limit: bool = bool(self.config.get("enable_user_limit", True))
+        self.enable_group_total_limit: bool = bool(self.config.get("enable_group_total_limit", True))
+        self.max_requests: int = max(1, int(self.config.get("max_requests", 6)))
+        self.time_window: int = max(1, int(self.config.get("time_window_seconds", 60)))
+        self.default_group_total: int = max(0, int(self.config.get("default_group_total", 0)))
         self.whitelist: list = self.config.get("whitelist", [])
         self.group_limits: Dict[str, int] = _parse_limit_list(self.config.get("group_limits", []))
         self.group_total_limits: Dict[str, int] = _parse_limit_list(self.config.get("group_total_limits", []))
@@ -95,6 +100,8 @@ class RateLimitPlugin(Star):
     def _sliding_window_check(records: deque, max_req: int, time_window: int,
                               now: float) -> Tuple[bool, float]:
         """通用滑动窗口检查（不记录，仅判断 + 返回冷却时间）。"""
+        if max_req <= 0:
+            return False, 0.0
         window_start = now - time_window
         while records and records[0] <= window_start:
             records.popleft()
@@ -107,6 +114,13 @@ class RateLimitPlugin(Star):
     def _sliding_window_record(records: deque, now: float):
         """记录一次请求时间戳。"""
         records.append(now)
+
+    def _cleanup_empty_records(self):
+        """清理空的滑动窗口记录，回收内存。"""
+        for d in (self._request_records, self._group_records):
+            empty_keys = [k for k, v in d.items() if not v]
+            for k in empty_keys:
+                del d[k]
 
     # ─── Hook: LLM 请求前拦截 ────────────────────────────────────
 
@@ -178,6 +192,13 @@ class RateLimitPlugin(Star):
     async def rl_status(self, event: AstrMessageEvent):
         """查看当前频率限制状态。"""
         self._reload_config()
+        # 先清理过期记录再统计，确保数据准确
+        now = time.time()
+        window_start = now - self.time_window
+        for records in list(self._request_records.values()) + list(self._group_records.values()):
+            while records and records[0] <= window_start:
+                records.popleft()
+        self._cleanup_empty_records()
         active_users = sum(1 for q in self._request_records.values() if q)
         active_groups = sum(1 for q in self._group_records.values() if q)
         gt_default = f"{self.default_group_total} 次" if self.default_group_total > 0 else "不限制"

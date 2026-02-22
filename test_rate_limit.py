@@ -6,7 +6,7 @@
 """
 import time
 from collections import defaultdict, deque
-from typing import Dict, List, Tuple
+from typing import Tuple
 
 
 class RateLimiter:
@@ -40,6 +40,8 @@ class RateLimiter:
     @staticmethod
     def _sw_check(records: deque, max_req: int, time_window: int,
                   now: float) -> Tuple[bool, float]:
+        if max_req <= 0:
+            return False, 0.0
         window_start = now - time_window
         while records and records[0] <= window_start:
             records.popleft()
@@ -88,7 +90,15 @@ def test_basic_allow():
     for i in range(3):
         ok, _, _ = rl.request("u", now=100.0 + i)
         assert ok
-    print("✅ test_basic_allow")
+    print("OK test_basic_allow")
+
+
+def test_max_req_zero():
+    """max_req=0 should always deny without IndexError"""
+    rl = RateLimiter(max_requests=0, time_window=60)
+    ok, _, reason = rl.request("u", now=0.0)
+    assert not ok and reason == "user_limit"
+    print("OK test_max_req_zero")
 
 
 def test_exceed_limit():
@@ -388,6 +398,7 @@ if __name__ == "__main__":
 
     s("basic")
     test_basic_allow()
+    test_max_req_zero()
     test_exceed_limit()
     test_window_expiry()
     test_users_isolated()
@@ -421,5 +432,6 @@ if __name__ == "__main__":
     test_default_group_total_private_bypass()
 
     print("\n" + "=" * 55)
-    print("ALL 25 TESTS PASSED!")
+    print("ALL 26 TESTS PASSED!")
     print("=" * 55)
+
