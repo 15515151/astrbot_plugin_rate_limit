@@ -231,17 +231,14 @@ class RateLimitPlugin(Star):
                 user_records, max_req, self.time_window, now
             )
             if not allowed:
-                event.stop_event()
                 try:
                     tip = self.tip_message.format(
                         cooldown=cooldown, max=max_req, window=self.time_window
                     )
                 except (KeyError, ValueError, IndexError):
                     tip = f"⚠️ 请求过于频繁，请稍后再试。"
-                try:
-                    await event.send(tip)
-                except Exception:
-                    logger.warning(f"[rate_limit] 发送用户限流提示失败: user={user_id}")
+                event.set_result(tip)
+                event.stop_event()
                 return
 
         # ── 检查 2: 群组总量 ──
@@ -254,17 +251,14 @@ class RateLimitPlugin(Star):
                 group_records, group_max, self.time_window, now
             )
             if not g_allowed:
-                event.stop_event()
                 try:
                     tip = self.group_tip_message.format(
                         cooldown=g_cooldown, max=group_max, window=self.time_window
                     )
                 except (KeyError, ValueError, IndexError):
                     tip = f"⚠️ 本群请求过于频繁，请稍后再试。"
-                try:
-                    await event.send(tip)
-                except Exception:
-                    logger.warning(f"[rate_limit] 发送群总量限流提示失败: group={group_id}")
+                event.set_result(tip)
+                event.stop_event()
                 return
 
         # ── 两项检查都通过，记录请求 ──
