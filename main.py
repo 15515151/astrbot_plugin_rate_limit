@@ -14,11 +14,12 @@ def _load_limits(raw) -> dict[str, int]:
 
     字典格式: {"id": count, ...}
     旧版列表格式: ["id:count", ...]
-    自动过滤 key 为空或 value <= 0 的条目。
+    自动过滤 key 为空或 value < 0 的条目。
+    特别地，value = 0 表示完全禁止该对象（拉黑）。
     """
     if isinstance(raw, dict):
         return {str(k).strip(): int(v) for k, v in raw.items()
-                if str(k).strip() and _safe_int(v, 0) > 0}
+                if str(k).strip() and _safe_int(v, -1) >= 0}
     if not isinstance(raw, list):
         return {}
     # 兼容旧版 ["id:count", ...] 格式
@@ -31,7 +32,7 @@ def _load_limits(raw) -> dict[str, int]:
         try:
             key = parts[0].strip()
             val = int(parts[1].strip())
-            if key and val > 0:
+            if key and val >= 0:
                 result[key] = val
         except (ValueError, IndexError):
             continue
@@ -136,18 +137,28 @@ class RateLimitPlugin(Star):
         """解析群组的总量限制。
 
         优先级: 群组自定义总量 > 全局默认群总量
-        返回 0 表示不限制。
+        返回值: -1 表示不限制，0 表示拉黑（完全禁止），> 0 表示具体限制次数。
+        注意: default_group_total = 0 表示不启用全局群限制（保持原有语义）。
         """
         if group_id in self.group_total_limits:
             return self.group_total_limits[group_id]
-        return self.default_group_total
+        # default_group_total = 0 表示不启用全局限制，返回 -1
+        # default_group_total > 0 表示全局默认限制值
+        return self.default_group_total if self.default_group_total > 0 else -1
 
     @staticmethod
     def _sliding_window_check(records: deque, max_req: int, time_window: int,
                               now: float) -> tuple[bool, float]:
-        """通用滑动窗口检查（不记录，仅判断 + 返回冷却时间）。"""
-        if max_req <= 0:
-            return False, 0.0
+        """通用滑动窗口检查（不记录，仅判断 + 返回冷却时间）。
+
+        max_req = 0: 拉黑，直接拒绝
+        max_req < 0: 不限制，直接通过
+        max_req > 0: 正常滑动窗口检查
+        """
+        if max_req == 0:
+            return False, float('inf')  # 拉黑：永久冷却
+        if max_req < 0:
+            return True, 0.0  # 不限制
         window_start = now - time_window
         while records and records[0] <= window_start:
             records.popleft()
@@ -242,19 +253,23 @@ class RateLimitPlugin(Star):
                 return
 
         # ── 检查 2: 群组总量 ──
-        group_max = 0
+        group_max = -1  # 默认不限制
         if self.enable_group_total_limit and group_id:
             group_max = self._resolve_group_total(group_id)
-        if group_id and group_max > 0:
+        if group_id and group_max >= 0:  # >= 0 表示需要检查（0=拉黑，>0=限制次数）
             group_records = self._group_records[group_id]
             g_allowed, g_cooldown = self._sliding_window_check(
                 group_records, group_max, self.time_window, now
             )
             if not g_allowed:
                 try:
-                    tip = self.group_tip_message.format(
-                        cooldown=g_cooldown, max=group_max, window=self.time_window
-                    )
+                    if group_max == 0:
+                        # 拉黑群组的特殊提示
+                        tip = "🚫 本群已被限制使用 LLM 功能。"
+                    else:
+                        tip = self.group_tip_message.format(
+                            cooldown=g_cooldown, max=group_max, window=self.time_window
+                        )
                 except (KeyError, ValueError, IndexError):
                     tip = f"⚠️ 本群请求过于频繁，请稍后再试。"
                 event.set_result(tip)
@@ -264,7 +279,7 @@ class RateLimitPlugin(Star):
         # ── 两项检查都通过，记录请求 ──
         if self.enable_user_limit:
             self._sliding_window_record(self._request_records[user_id], now)
-        if group_id and group_max > 0:
+        if group_id and group_max > 0:  # 只有 > 0 才记录（0=拉黑不记录，< 0=不限制不记录）
             self._sliding_window_record(self._group_records[group_id], now)
 
     # ─── 管理指令组 /rl ──────────────────────────────────────────
@@ -308,9 +323,12 @@ class RateLimitPlugin(Star):
             lines.append("  🏢 群组总量限制:")
             items = list(self.group_total_limits.items())
             for gid, limit in items[:self._MAX_DISPLAY]:
-                grp_records = self._group_records.get(gid)
-                used = len(grp_records) if grp_records else 0
-                lines.append(f"    · {gid}: {limit} 次（已用 {used}）")
+                if limit == 0:
+                    lines.append(f"    · {gid}: 🚫 已拉黑")
+                else:
+                    grp_records = self._group_records.get(gid)
+                    used = len(grp_records) if grp_records else 0
+                    lines.append(f"    · {gid}: {limit} 次（已用 {used}）")
             if len(items) > self._MAX_DISPLAY:
                 lines.append(f"    ... 省略 {len(items) - self._MAX_DISPLAY} 条")
         if self.user_limits:
@@ -477,13 +495,13 @@ class RateLimitPlugin(Star):
     @rl_group.command("gtotal_set")
     @filter.permission_type(PermissionType.ADMIN)
     async def rl_gtotal_set(self, event: AstrMessageEvent, group_id: str, count: int):
-        """为群组设置总请求次数限制。用法: /rl gtotal_set <群组ID> <总次数>"""
+        """为群组设置总请求次数限制。用法: /rl gtotal_set <群组ID> <总次数> (0=拉黑)"""
         group_id = group_id.strip()
         if not group_id:
             yield event.plain_result("❌ 群组 ID 不能为空。")
             return
-        if count < 1:
-            yield event.plain_result("❌ 总次数必须 ≥ 1。")
+        if count < 0:
+            yield event.plain_result("❌ 总次数必须 ≥ 0（0 表示拉黑该群）。")
             return
         self.group_total_limits[group_id] = count
         try:
@@ -492,9 +510,12 @@ class RateLimitPlugin(Star):
             self.group_total_limits.pop(group_id, None)
             yield event.plain_result("❌ 保存配置失败。")
             return
-        yield event.plain_result(
-            f"✅ 群组 {group_id} 的总量限制已设置为 {count} 次/{self.time_window} 秒（全群共享）。"
-        )
+        if count == 0:
+            yield event.plain_result(f"🚫 群组 {group_id} 已被拉黑（完全禁止使用 LLM）。")
+        else:
+            yield event.plain_result(
+                f"✅ 群组 {group_id} 的总量限制已设置为 {count} 次/{self.time_window} 秒（全群共享）。"
+            )
 
     @rl_group.command("gtotal_del")
     @filter.permission_type(PermissionType.ADMIN)
@@ -518,9 +539,12 @@ class RateLimitPlugin(Star):
         lines = ["🏢 群组总量限制:"]
         items = list(self.group_total_limits.items())
         for gid, limit in items[:self._MAX_DISPLAY]:
-            grp_records = self._group_records.get(gid)
-            used = len(grp_records) if grp_records else 0
-            lines.append(f"  · {gid}: {limit} 次/{self.time_window} 秒（已用 {used}）")
+            if limit == 0:
+                lines.append(f"  · {gid}: 🚫 已拉黑")
+            else:
+                grp_records = self._group_records.get(gid)
+                used = len(grp_records) if grp_records else 0
+                lines.append(f"  · {gid}: {limit} 次/{self.time_window} 秒（已用 {used}）")
         if len(items) > self._MAX_DISPLAY:
             lines.append(f"  ... 省略 {len(items) - self._MAX_DISPLAY} 条")
         yield event.plain_result("\n".join(lines))
